@@ -1,5 +1,6 @@
 import os
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
 from collections import deque
 
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -24,7 +25,7 @@ app = FastAPI(title="Nortsur WhatsApp Bot")
 PROCESSED_MESSAGES: deque[str] = deque(maxlen=1000)
 
 
-def is_duplicate_message(message_id: str | None) -> bool:
+def is_duplicate_message(message_id: Optional[str]) -> bool:
     """Devuelve True si ya procesamos este message_id de WhatsApp."""
     if not message_id:
         return False
@@ -38,6 +39,24 @@ def is_duplicate_message(message_id: str | None) -> bool:
 # ------------------------------
 # Helpers
 # ------------------------------
+
+CODIGO_REGEX = re.compile(r"^[A-Z]{2}\d{3}$")
+
+WEB_URL = "https://nortsur.com.ar"
+INSTAGRAM = "@distribuidora_nort_sur"
+
+
+def contiene_codigos(text: str) -> bool:
+    """
+    Detecta si el texto contiene algo con forma de código: ej. CB001, PN004, etc.
+    """
+    for token in re.split(r"[,\s\n]+", text.upper()):
+        token = token.strip()
+        if CODIGO_REGEX.match(token):
+            return True
+    return False
+
+
 def parse_items_from_text(text: str) -> List[Dict[str, Any]]:
     """
     Parsea un texto tipo:
@@ -53,9 +72,7 @@ def parse_items_from_text(text: str) -> List[Dict[str, Any]]:
     # Separar por comas y por saltos de línea
     partes_brutas: List[str] = []
     for linea in text.splitlines():
-        partes_brutas.extend(
-            p.strip() for p in linea.split(",") if p.strip()
-        )
+        partes_brutas.extend(p.strip() for p in linea.split(",") if p.strip())
 
     for parte in partes_brutas:
         tokens = parte.split()
@@ -77,24 +94,141 @@ def parse_items_from_text(text: str) -> List[Dict[str, Any]]:
     return items
 
 
-async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
+async def buscar_productos_por_descripcion(texto: str) -> List[Dict[str, Any]]:
     """
-    Llama al backend Nortsur para crear el pedido
-    y devuelve el texto listo para responder al cliente.
+    Llama al backend Nortsur para buscar productos que matcheen la descripción.
+    Usa el endpoint /bot/productos/buscar del backend.
     """
     if not NORTSUR_API_BASE_URL:
         raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
 
-    items = parse_items_from_text(text_body)
-    if not items:
-        # Mensaje amable si no pudimos entender el pedido
-        return (
-            "No pude entender el pedido 😕\n\n"
-            "Usá este formato, por ejemplo:\n"
-            "CB001 x1\n"
-            "CB004 x2, PN004 x1"
-        )
+    url = f"{NORTSUR_API_BASE_URL}/bot/productos/buscar"
+    params = {"texto": texto}
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        return resp.json()
 
+
+def mensaje_bienvenida() -> str:
+    return (
+        "Hola 👋, soy el asistente de pedidos de *Nortsur*.\n\n"
+        "📦 *Cómo hacer tu pedido:*\n"
+        "- Si ya sos cliente, podés mandarme el *código* o la *descripción* del producto/combos.\n"
+        "  Ejemplos:\n"
+        "  • CB001 x2\n"
+        "  • combo pancho doble x1\n\n"
+        "🛒 *Si todavía no sos cliente:*\n"
+        "Podés ver nuestros productos en:\n"
+        f"🌐 Web: {WEB_URL}\n"
+        f"📸 Instagram: {INSTAGRAM}\n\n"
+        "Después envianos tu *nombre*, *dirección* y *zona* para darte de alta. 🙌"
+    )
+
+
+def mensaje_formato_inicial() -> str:
+    return (
+        "No pude entender el pedido 😕\n\n"
+        "Usá este formato, por ejemplo:\n"
+        "• CB001 x1\n"
+        "• CB001 x2, CB004 x1\n"
+        "• combo pancho doble x1\n\n"
+        "Si querés ver el catálogo completo:\n"
+        f"🌐 Web: {WEB_URL}\n"
+        f"📸 Instagram: {INSTAGRAM}"
+    )
+
+
+def mensaje_error_generico() -> str:
+    return (
+        "Tuvimos un error al registrar tu pedido 😕\n"
+        "Por favor, intentá de nuevo en unos minutos o avisá al vendedor."
+    )
+
+
+async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
+    """
+    Decide qué hacer con el mensaje del cliente:
+    - Si es un saludo / ayuda -> mensaje de bienvenida.
+    - Si contiene códigos -> usamos parse_items_from_text.
+    - Si es descripción -> buscamos en backend y si hay match único, armamos pedido.
+    """
+    if not NORTSUR_API_BASE_URL:
+        raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
+
+    text_body = (text_body or "").strip()
+    if not text_body:
+        return mensaje_formato_inicial()
+
+    lower = text_body.lower()
+
+    # 1) Mensajes de saludo / ayuda => bienvenida
+    if any(
+        palabra in lower
+        for palabra in [
+            "hola",
+            "buenas",
+            "buen dia",
+            "buen día",
+            "menu",
+            "menú",
+            "productos",
+            "catálogo",
+            "catalogo",
+            "ayuda",
+        ]
+    ):
+        return mensaje_bienvenida()
+
+    # 2) Pedido con códigos (CB001, PN004, etc.)
+    if contiene_codigos(text_body):
+        items = parse_items_from_text(text_body)
+        if not items:
+            return mensaje_formato_inicial()
+    else:
+        # 3) Pedido por descripción
+        try:
+            productos = await buscar_productos_por_descripcion(text_body)
+        except Exception as e:
+            print("Error al buscar productos por descripción:", repr(e))
+            return mensaje_error_generico()
+
+        if not productos:
+            return (
+                "No encontré ningún producto que coincida con tu mensaje 😕\n\n"
+                "Podés ver todos los productos en:\n"
+                f"🌐 Web: {WEB_URL}\n"
+                f"📸 Instagram: {INSTAGRAM}\n\n"
+                "O mandame el código del producto (por ejemplo: CB001 x1)."
+            )
+
+        if len(productos) > 1:
+            lineas = []
+            for p in productos:
+                linea = f"- {p.get('codigo', '')} {p.get('nombre', '')}".strip()
+                if p.get("presentacion"):
+                    linea += f" ({p['presentacion']})"
+                lineas.append(linea)
+            lista = "\n".join(lineas)
+            return (
+                "Encontré varios productos que coinciden con tu descripción:\n\n"
+                f"{lista}\n\n"
+                "Por favor, respondé con el *código* del que querés (por ejemplo: CB001 x2)."
+            )
+
+        # Un único producto => armamos pedido con ese código
+        p = productos[0]
+        cantidad = 1
+        for num in re.findall(r"\d+", text_body):
+            try:
+                cantidad = int(num)
+                break
+            except ValueError:
+                pass
+
+        items = [{"codigo": p["codigo"], "cantidad": cantidad}]
+
+    # Si llegamos acá, tenemos items y llamamos al backend para crear el pedido
     payload = {
         "wa_phone": wa_phone,
         "observaciones": f"Pedido vía WhatsApp desde {wa_phone}",
@@ -108,7 +242,7 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
         "/pedidos/from-whatsapp/",
     ]
 
-    data: Dict[str, Any] | None = None
+    data: Optional[Dict[str, Any]] = None
 
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
         for path in posibles_paths:
@@ -132,11 +266,12 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
             # Para otros códigos (400, 500, etc.) levantamos el error
             resp.raise_for_status()
 
-    if not data or not data.get("ok"):
-        return (
-            "Hubo un problema al registrar tu pedido 😕\n"
-            "Por favor, intentá de nuevo en unos minutos o avisá al vendedor."
-        )
+    if not data:
+        return mensaje_error_generico()
+
+    if not data.get("ok"):
+        # Permitimos que el backend mande su propio mensaje (por ej. "no sos cliente")
+        return data.get("mensaje_respuesta") or mensaje_error_generico()
 
     return data["mensaje_respuesta"]
 
@@ -219,13 +354,13 @@ async def whatsapp_webhook(request: Request):
                 if message.get("type") != "text":
                     continue
 
-                wa_phone = message.get("from")  # ej: "5491155732845"
+                wa_phone = message.get("from")  # ej: "54911..."
                 text_body = message.get("text", {}).get("body", "").strip()
 
                 if not wa_phone:
                     continue
 
-                # Procesamos el pedido
+                # Procesamos el pedido / mensaje
                 try:
                     respuesta = await enviar_pedido_a_nortsur(
                         wa_phone,
@@ -233,11 +368,8 @@ async def whatsapp_webhook(request: Request):
                     )
                 except Exception as e:
                     # Log para debug en servidor
-                    print("Error al llamar a Nortsur:", repr(e))
-                    respuesta = (
-                        "Tuvimos un error al registrar tu pedido 😕\n"
-                        "Por favor, intentá de nuevo en unos minutos o avisá al vendedor."
-                    )
+                    print("Error al procesar mensaje:", repr(e))
+                    respuesta = mensaje_error_generico()
 
                 # Enviamos siempre la respuesta al cliente (éxito o error)
                 try:

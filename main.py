@@ -94,6 +94,42 @@ def parse_items_from_text(text: str) -> List[Dict[str, Any]]:
     return items
 
 
+async def buscar_cliente_por_telefono(wa_phone: str) -> Optional[Dict[str, Any]]:
+    """
+    Llama al backend Nortsur para buscar un cliente por teléfono
+    usando /clientes/by-phone/{telefono}.
+    Devuelve el JSON del cliente o None si no existe.
+    """
+    if not NORTSUR_API_BASE_URL:
+        raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
+
+    url = f"{NORTSUR_API_BASE_URL}/clientes/by-phone/{wa_phone}"
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        try:
+            resp = await client.get(url)
+        except httpx.RequestError as e:
+            print("Error al buscar cliente por teléfono:", repr(e))
+            return None
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except Exception as e:
+                print("Error parseando JSON de cliente:", repr(e), resp.text[:200])
+                return None
+
+        if resp.status_code == 404:
+            # No está dado de alta
+            return None
+
+        # Otros errores "raros"
+        resp.raise_for_status()
+        return None
+
+
+
+
 async def buscar_productos_por_descripcion(texto: str) -> List[Dict[str, Any]]:
     """
     Llama al backend Nortsur para buscar productos que matcheen la descripción.
@@ -126,16 +162,36 @@ def mensaje_bienvenida() -> str:
     )
 
 
-def mensaje_formato_inicial() -> str:
+def mensaje_bienvenida(nombre: Optional[str] = None, es_cliente: bool = False) -> str:
+    """
+    Mensaje de bienvenida:
+    - Si es_cliente=True y tenemos nombre → saludo personalizado.
+    - Si no, mensaje genérico para no clientes / desconocidos.
+    """
+    if es_cliente:
+        nombre = (nombre or "").strip()
+        cabecera = f"Hola {nombre}, soy el asistente de pedidos de *Nortsur*.\n\n"
+        cuerpo = (
+            "Podés hacer tu pedido mandando el *código* o la *descripción* "
+            "del producto o combo que querés.\n"
+            "Ejemplos:\n"
+            " • CB001 x2\n"
+            " • combo pancho doble x1\n"
+        )
+        return cabecera + cuerpo
+
+    # No cliente / genérico
     return (
-        "No pude entender el pedido 😕\n\n"
-        "Usá este formato, por ejemplo:\n"
-        "• CB001 x1\n"
-        "• CB001 x2, CB004 x1\n"
-        "• combo pancho doble x1\n\n"
-        "Si querés ver el catálogo completo:\n"
-        f"🌐 Web: {WEB_URL}\n"
-        f"📸 Instagram: {INSTAGRAM}"
+        "Hola, soy el asistente de pedidos de *Nortsur*.\n\n"
+        "Si ya sos cliente, podés hacer tu pedido mandando el *código* o la "
+        "*descripción* del producto/combos.\n"
+        "Ejemplos:\n"
+        " • CB001 x2\n"
+        " • combo pancho doble x1\n\n"
+        "Si todavía no sos cliente, podés ver nuestros productos en:\n"
+        f" Web: {WEB_URL}\n"
+        f" Instagram: {INSTAGRAM}\n\n"
+        "Después envianos tu *nombre*, *dirección* y *zona* para darte de alta.\n"
     )
 
 
@@ -163,22 +219,32 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
     lower = text_body.lower()
 
     # 1) Mensajes de saludo / ayuda => bienvenida
+    # 1) Mensajes de saludo / ayuda => bienvenida
+    # 1) Mensajes de saludo / ayuda => bienvenida (ahora personalizada si es cliente)
     if any(
         palabra in lower
         for palabra in [
-            "hola",
-            "buenas",
-            "buen dia",
-            "buen día",
-            "menu",
-            "menú",
-            "productos",
-            "catálogo",
-            "catalogo",
-            "ayuda",
+            "hola", "buenas", "buen dia", "buen día",
+            "menu", "menú", "productos", "catálogo", "catalogo", "ayuda",
         ]
     ):
-        return mensaje_bienvenida()
+        nombre_cliente: Optional[str] = None
+
+        try:
+            cliente = await buscar_cliente_por_telefono(wa_phone)
+            if cliente:
+                nombre_cliente = (cliente.get("nombre") or "").strip()
+        except Exception as e:
+            print("Error al buscar cliente en saludo:", repr(e))
+
+        if nombre_cliente:
+            # Cliente encontrado → saludo con nombre
+            return mensaje_bienvenida(nombre=nombre_cliente, es_cliente=True)
+        else:
+            # No cliente o error buscando → mensaje genérico con web/instagram
+            return mensaje_bienvenida()
+
+
 
     # 2) Pedido con códigos (CB001, PN004, etc.)
     if contiene_codigos(text_body):

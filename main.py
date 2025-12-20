@@ -8,7 +8,9 @@ from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 import httpx
 
-# Cargar variables de entorno desde .env
+# ==========================
+# Cargar variables de entorno
+# ==========================
 load_dotenv()
 
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "")
@@ -16,6 +18,13 @@ WA_ACCESS_TOKEN = os.getenv("WA_ACCESS_TOKEN", "")
 WA_PHONE_NUMBER_ID = os.getenv("WA_PHONE_NUMBER_ID", "")
 WA_API_VERSION = os.getenv("WA_API_VERSION", "v22.0")
 NORTSUR_API_BASE_URL = os.getenv("NORTSUR_API_BASE_URL", "").rstrip("/")
+
+# Base local y URL para imágenes
+IMG_BASE_DIR = os.getenv("NORTSUR_IMG_BASE_DIR", "/opt/nortsur-bot/img")
+IMG_BASE_URL = os.getenv("NORTSUR_IMG_BASE_URL", "https://pedidos.nexouno.com.ar/img")
+
+WEB_URL = "https://nortsur.com.ar"
+INSTAGRAM = "@distribuidora_nort_sur"
 
 app = FastAPI(title="Nortsur WhatsApp Bot")
 
@@ -36,14 +45,109 @@ def is_duplicate_message(message_id: Optional[str]) -> bool:
     return False
 
 
-# ------------------------------
-# Helpers
-# ------------------------------
+# ==========================
+# Helpers de imágenes
+# ==========================
+def load_image_urls(subdir: str) -> List[str]:
+    """
+    Lee todos los archivos de imagen de IMG_BASE_DIR/subdir
+    y arma las URLs públicas usando IMG_BASE_URL/subdir/archivo.
+    """
+    dir_path = os.path.join(IMG_BASE_DIR, subdir)
+    urls: List[str] = []
+    try:
+        for name in sorted(os.listdir(dir_path)):
+            lower = name.lower()
+            if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                urls.append(f"{IMG_BASE_URL}/{subdir}/{name}")
+    except FileNotFoundError:
+        print(f"[IMG] Carpeta no encontrada: {dir_path}")
+    except Exception as e:
+        print(f"[IMG] Error leyendo {dir_path}: {repr(e)}")
+    return urls
 
+
+IMGS_NO_CLIENTE = load_image_urls("no_cliente")
+IMGS_LISTA_GENERAL = load_image_urls("lista_general")
+IMGS_LISTA_DESTACADOS = load_image_urls("lista_destacados")
+
+print("[IMG] IMGS_NO_CLIENTE:", IMGS_NO_CLIENTE)
+
+# ==========================
+# Envío de mensajes WhatsApp
+# ==========================
+async def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
+    """
+    Envía un texto por WhatsApp Cloud API.
+    """
+    if not WA_ACCESS_TOKEN or not WA_PHONE_NUMBER_ID:
+        raise RuntimeError("Faltan credenciales de WhatsApp en .env")
+
+    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def send_whatsapp_image(
+    to: str,
+    image_url: str,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Envía una imagen por WhatsApp Cloud API usando una URL pública.
+    """
+    if not WA_ACCESS_TOKEN or not WA_PHONE_NUMBER_ID:
+        raise RuntimeError("Faltan credenciales de WhatsApp en .env")
+
+    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"link": image_url},
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+# ==========================
+# Helpers de negocio
+# ==========================
 CODIGO_REGEX = re.compile(r"^[A-Z]{2}\d{3}$")
 
-WEB_URL = "https://nortsur.com.ar"
-INSTAGRAM = "@distribuidora_nort_sur"
+
+def normalize_wa_phone(wa_phone: str) -> str:
+    """
+    De un número tipo '5491162519659' o '+54 9 11 6251-9659'
+    devuelve solo los últimos 10 dígitos: '1162519659'.
+    Esto debe coincidir con cómo guardamos el teléfono en la tabla clientes.
+    """
+    digits = "".join(ch for ch in wa_phone if ch.isdigit())
+    if len(digits) > 10:
+        return digits[-10:]
+    return digits
 
 
 def contiene_codigos(text: str) -> bool:
@@ -103,7 +207,8 @@ async def buscar_cliente_por_telefono(wa_phone: str) -> Optional[Dict[str, Any]]
     if not NORTSUR_API_BASE_URL:
         raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
 
-    url = f"{NORTSUR_API_BASE_URL}/clientes/by-phone/{wa_phone}"
+    telefono_normalizado = normalize_wa_phone(wa_phone)
+    url = f"{NORTSUR_API_BASE_URL}/clientes/by-phone/{telefono_normalizado}"
 
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
         try:
@@ -128,8 +233,6 @@ async def buscar_cliente_por_telefono(wa_phone: str) -> Optional[Dict[str, Any]]
         return None
 
 
-
-
 async def buscar_productos_por_descripcion(texto: str) -> List[Dict[str, Any]]:
     """
     Llama al backend Nortsur para buscar productos que matcheen la descripción.
@@ -146,19 +249,19 @@ async def buscar_productos_por_descripcion(texto: str) -> List[Dict[str, Any]]:
         return resp.json()
 
 
-def mensaje_bienvenida() -> str:
+def mensaje_formato_inicial() -> str:
+    """
+    Mensaje cuando no entendemos el formato del pedido.
+    """
     return (
-        "Hola 👋, soy el asistente de pedidos de *Nortsur*.\n\n"
-        "📦 *Cómo hacer tu pedido:*\n"
-        "- Si ya sos cliente, podés mandarme el *código* o la *descripción* del producto/combos.\n"
-        "  Ejemplos:\n"
-        "  • CB001 x2\n"
-        "  • combo pancho doble x1\n\n"
-        "🛒 *Si todavía no sos cliente:*\n"
-        "Podés ver nuestros productos en:\n"
-        f"🌐 Web: {WEB_URL}\n"
-        f"📸 Instagram: {INSTAGRAM}\n\n"
-        "Después envianos tu *nombre*, *dirección* y *zona* para darte de alta. 🙌"
+        "No pude entender el pedido 😕\n\n"
+        "Usá este formato, por ejemplo:\n"
+        " • CB001 x1\n"
+        " • CB001 x2, CB004 x1\n"
+        " • combo pancho doble x1\n\n"
+        "Si querés ver el catálogo completo:\n"
+        f" 🌐 Web: {WEB_URL}\n"
+        f" 📸 Instagram: {INSTAGRAM}"
     )
 
 
@@ -188,6 +291,7 @@ def mensaje_bienvenida(nombre: Optional[str] = None, es_cliente: bool = False) -
         "Ejemplos:\n"
         " • CB001 x2\n"
         " • combo pancho doble x1\n\n"
+        "Te dejo algunos productos destacados 👇\n\n"
         "Si todavía no sos cliente, podés ver nuestros productos en:\n"
         f" Web: {WEB_URL}\n"
         f" Instagram: {INSTAGRAM}\n\n"
@@ -202,10 +306,13 @@ def mensaje_error_generico() -> str:
     )
 
 
+# ==========================
+# Lógica principal de pedido
+# ==========================
 async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
     """
     Decide qué hacer con el mensaje del cliente:
-    - Si es un saludo / ayuda -> mensaje de bienvenida.
+    - Si es un saludo / ayuda -> mensaje de bienvenida (personalizado si es cliente).
     - Si contiene códigos -> usamos parse_items_from_text.
     - Si es descripción -> buscamos en backend y si hay match único, armamos pedido.
     """
@@ -218,14 +325,20 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
 
     lower = text_body.lower()
 
-    # 1) Mensajes de saludo / ayuda => bienvenida
-    # 1) Mensajes de saludo / ayuda => bienvenida
-    # 1) Mensajes de saludo / ayuda => bienvenida (ahora personalizada si es cliente)
+    # 1) Mensajes de saludo / ayuda => bienvenida (personalizada si es cliente)
     if any(
         palabra in lower
         for palabra in [
-            "hola", "buenas", "buen dia", "buen día",
-            "menu", "menú", "productos", "catálogo", "catalogo", "ayuda",
+            "hola",
+            "buenas",
+            "buen dia",
+            "buen día",
+            "menu",
+            "menú",
+            "productos",
+            "catálogo",
+            "catalogo",
+            "ayuda",
         ]
     ):
         nombre_cliente: Optional[str] = None
@@ -238,13 +351,12 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
             print("Error al buscar cliente en saludo:", repr(e))
 
         if nombre_cliente:
-            # Cliente encontrado → saludo con nombre
+            # ✅ Cliente encontrado → saludo con nombre (sin imágenes)
             return mensaje_bienvenida(nombre=nombre_cliente, es_cliente=True)
         else:
-            # No cliente o error buscando → mensaje genérico con web/instagram
-            return mensaje_bienvenida()
-
-
+            # 🚫 No es cliente → devolvemos un marcador especial para
+            # que el webhook sepa que debe mandar imágenes luego del texto.
+            return "__NO_CLIENTE__" + mensaje_bienvenida()
 
     # 2) Pedido con códigos (CB001, PN004, etc.)
     if contiene_codigos(text_body):
@@ -262,7 +374,9 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
         if not productos:
             return (
                 "No encontré ningún producto que coincida con tu mensaje 😕\n\n"
-                "Podés ver todos los productos en:\n"
+                "Si querés ver opciones y combos destacados, podés escribir *Hola* "
+                "y te muestro un resumen con imágenes.\n\n"
+                "También podés ver todos los productos en:\n"
                 f"🌐 Web: {WEB_URL}\n"
                 f"📸 Instagram: {INSTAGRAM}\n\n"
                 "O mandame el código del producto (por ejemplo: CB001 x1)."
@@ -342,42 +456,14 @@ async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
     return data["mensaje_respuesta"]
 
 
-async def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
-    """
-    Envía un texto por WhatsApp Cloud API.
-    """
-    if not WA_ACCESS_TOKEN or not WA_PHONE_NUMBER_ID:
-        raise RuntimeError("Faltan credenciales de WhatsApp en .env")
-
-    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
-
-
-# ------------------------------
-# Healthcheck simple
-# ------------------------------
+# ==========================
+# Rutas FastAPI
+# ==========================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ------------------------------
-# Webhook de verificación (GET)
-# ------------------------------
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(
     hub_mode: str = Query(default="", alias="hub.mode"),
@@ -385,16 +471,13 @@ async def verify_webhook(
     hub_verify_token: str = Query(default="", alias="hub.verify_token"),
 ):
     """
-    Endpoint que llama Meta al configurar el webhook.
+    Endpoint que llama Meta al configurar el webhook (verificación inicial).
     """
     if hub_mode == "subscribe" and hub_verify_token == WA_VERIFY_TOKEN:
         return hub_challenge
     raise HTTPException(status_code=403, detail="Token de verificación inválido")
 
 
-# ------------------------------
-# Webhook de mensajes (POST)
-# ------------------------------
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
     body = await request.json()
@@ -426,6 +509,9 @@ async def whatsapp_webhook(request: Request):
                 if not wa_phone:
                     continue
 
+                # --- NUEVO: control para saber si hay que mandar imágenes luego ---
+                send_no_cliente_images = False
+
                 # Procesamos el pedido / mensaje
                 try:
                     respuesta = await enviar_pedido_a_nortsur(
@@ -433,14 +519,31 @@ async def whatsapp_webhook(request: Request):
                         text_body or "",
                     )
                 except Exception as e:
-                    # Log para debug en servidor
                     print("Error al procesar mensaje:", repr(e))
                     respuesta = mensaje_error_generico()
 
-                # Enviamos siempre la respuesta al cliente (éxito o error)
+                # Detectamos el caso especial de saludo NO cliente
+                if respuesta.startswith("__NO_CLIENTE__"):
+                    send_no_cliente_images = True
+                    respuesta = respuesta[len("__NO_CLIENTE__"):]
+
+                # 1) Enviamos SIEMPRE el texto primero
                 try:
                     await send_whatsapp_text(wa_phone, respuesta)
                 except Exception as e:
                     print("Error al enviar mensaje de WhatsApp:", repr(e))
 
+                # 2) Si corresponde, mandamos las imágenes después del texto
+                if send_no_cliente_images and IMGS_NO_CLIENTE:
+                    for url in IMGS_NO_CLIENTE:
+                        try:
+                            await send_whatsapp_image(
+                                wa_phone,
+                                url,
+                                caption="Producto destacado Nortsur",
+                            )
+                        except Exception as e:
+                            print("Error al enviar imagen NO cliente:", repr(e))
+
     return {"status": "ok"}
+

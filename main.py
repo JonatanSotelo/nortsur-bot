@@ -1,15 +1,15 @@
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Tuple, List
 from collections import deque
 
-from fastapi import FastAPI, Request, HTTPException, Query
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
-import httpx
 
 # ==========================
-# Cargar variables de entorno
+# Config
 # ==========================
 load_dotenv()
 
@@ -19,531 +19,351 @@ WA_PHONE_NUMBER_ID = os.getenv("WA_PHONE_NUMBER_ID", "")
 WA_API_VERSION = os.getenv("WA_API_VERSION", "v22.0")
 NORTSUR_API_BASE_URL = os.getenv("NORTSUR_API_BASE_URL", "").rstrip("/")
 
-# Base local y URL para imágenes
 IMG_BASE_DIR = os.getenv("NORTSUR_IMG_BASE_DIR", "/opt/nortsur-bot/img")
-IMG_BASE_URL = os.getenv("NORTSUR_IMG_BASE_URL", "https://pedidos.nexouno.com.ar/img")
-
-WEB_URL = "https://nortsur.com.ar"
-INSTAGRAM = "@distribuidora_nort_sur"
+IMG_BASE_URL = os.getenv("NORTSUR_IMG_BASE_URL", "").rstrip("/")  # opcional
 
 app = FastAPI(title="Nortsur WhatsApp Bot")
 
-# =====================================================================
-# Anti-duplicados: recordamos los últimos mensajes de WhatsApp procesados
-# =====================================================================
+# Anti-duplicados WhatsApp
 PROCESSED_MESSAGES: deque[str] = deque(maxlen=1000)
 
+# Estado en memoria (simple)
+GREETED: set[str] = set()
 
-def is_duplicate_message(message_id: Optional[str]) -> bool:
-    """Devuelve True si ya procesamos este message_id de WhatsApp."""
+
+# ==========================
+# Helpers: WhatsApp payload
+# ==========================
+def _get(obj: Any, *path: Any, default=None):
+    cur = obj
+    for p in path:
+        try:
+            if isinstance(p, int):
+                cur = cur[p]
+            else:
+                cur = cur.get(p)
+        except Exception:
+            return default
+        if cur is None:
+            return default
+    return cur
+
+
+def parse_incoming(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Devuelve (message_id, from_phone, text_body)
+    """
+    message_id = _get(payload, "entry", 0, "changes", 0, "value", "messages", 0, "id")
+    from_phone = _get(payload, "entry", 0, "changes", 0, "value", "messages", 0, "from")
+    text_body = _get(payload, "entry", 0, "changes", 0, "value", "messages", 0, "text", "body")
+
+    # Si viene otro tipo (audio/image), text_body queda None
+    return message_id, from_phone, text_body
+
+
+def is_duplicate(message_id: Optional[str]) -> bool:
     if not message_id:
         return False
     if message_id in PROCESSED_MESSAGES:
-        print(f"[Webhook] Mensaje duplicado {message_id}, se ignora.")
         return True
     PROCESSED_MESSAGES.append(message_id)
     return False
 
 
 # ==========================
-# Helpers de imágenes
+# WhatsApp send
 # ==========================
-def load_image_urls(subdir: str) -> List[str]:
-    """
-    Lee todos los archivos de imagen de IMG_BASE_DIR/subdir
-    y arma las URLs públicas usando IMG_BASE_URL/subdir/archivo.
-    """
-    dir_path = os.path.join(IMG_BASE_DIR, subdir)
-    urls: List[str] = []
-    try:
-        for name in sorted(os.listdir(dir_path)):
-            lower = name.lower()
-            if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                urls.append(f"{IMG_BASE_URL}/{subdir}/{name}")
-    except FileNotFoundError:
-        print(f"[IMG] Carpeta no encontrada: {dir_path}")
-    except Exception as e:
-        print(f"[IMG] Error leyendo {dir_path}: {repr(e)}")
-    return urls
+def wa_headers() -> Dict[str, str]:
+    if not WA_ACCESS_TOKEN:
+        raise RuntimeError("Falta WA_ACCESS_TOKEN en .env")
+    return {"Authorization": f"Bearer {WA_ACCESS_TOKEN}", "Content-Type": "application/json"}
 
 
-IMGS_NO_CLIENTE = load_image_urls("no_cliente")
-IMGS_LISTA_GENERAL = load_image_urls("lista_general")
-IMGS_LISTA_DESTACADOS = load_image_urls("lista_destacados")
-
-print("[IMG] IMGS_NO_CLIENTE:", IMGS_NO_CLIENTE)
-
-# ==========================
-# Envío de mensajes WhatsApp
-# ==========================
-async def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
-    """
-    Envía un texto por WhatsApp Cloud API.
-    """
-    if not WA_ACCESS_TOKEN or not WA_PHONE_NUMBER_ID:
-        raise RuntimeError("Faltan credenciales de WhatsApp en .env")
-
+async def wa_send_text(to_phone: str, text: str) -> None:
     url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": to_phone,
         "type": "text",
-        "text": {"body": text},
+        "text": {"preview_url": False, "body": text},
     }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=wa_headers(), json=data)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=500, detail=f"WhatsApp send_text error: {r.status_code} {r.text}")
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
 
-
-async def send_whatsapp_image(
-    to: str,
-    image_url: str,
-    caption: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Envía una imagen por WhatsApp Cloud API usando una URL pública.
-    """
-    if not WA_ACCESS_TOKEN or not WA_PHONE_NUMBER_ID:
-        raise RuntimeError("Faltan credenciales de WhatsApp en .env")
-
+async def wa_send_image_url(to_phone: str, image_url: str, caption: Optional[str] = None) -> None:
     url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
     payload: Dict[str, Any] = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": to_phone,
         "type": "image",
         "image": {"link": image_url},
     }
     if caption:
         payload["image"]["caption"] = caption
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=wa_headers(), json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=500, detail=f"WhatsApp send_image error: {r.status_code} {r.text}")
+
+
+def list_no_cliente_images() -> List[str]:
+    """
+    Devuelve lista de URLs (si IMG_BASE_URL está) o paths locales (si no).
+    La regla del proyecto: en caso __NO_CLIENTE__ mandamos imágenes DESPUÉS del texto.
+    """
+    if not os.path.isdir(IMG_BASE_DIR):
+        return []
+
+    files = []
+    for name in sorted(os.listdir(IMG_BASE_DIR)):
+        low = name.lower()
+        if low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png") or low.endswith(".webp"):
+            files.append(name)
+
+    if not files:
+        return []
+
+    if IMG_BASE_URL:
+        return [f"{IMG_BASE_URL}/{f}" for f in files]
+
+    # Sin URL pública no podemos “linkear” directo; en ese caso devolvemos vacío
+    # (si querés, podemos implementar subida de media a WhatsApp y enviar por media_id)
+    return []
 
 
 # ==========================
-# Helpers de negocio
+# Backend Nortsur calls
 # ==========================
-CODIGO_REGEX = re.compile(r"^[A-Z]{2}\d{3}$")
+async def backend_get_resumen(pedido_id: int) -> str:
+    url = f"{NORTSUR_API_BASE_URL}/pedidos/{pedido_id}/resumen"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url)
+        if r.status_code >= 400:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Backend resumen error: {r.status_code} {r.text}",
+            )
 
-
-def normalize_wa_phone(wa_phone: str) -> str:
-    """
-    De un número tipo '5491162519659' o '+54 9 11 6251-9659'
-    devuelve solo los últimos 10 dígitos: '1162519659'.
-    Esto debe coincidir con cómo guardamos el teléfono en la tabla clientes.
-    """
-    digits = "".join(ch for ch in wa_phone if ch.isdigit())
-    if len(digits) > 10:
-        return digits[-10:]
-    return digits
-
-
-def contiene_codigos(text: str) -> bool:
-    """
-    Detecta si el texto contiene algo con forma de código: ej. CB001, PN004, etc.
-    """
-    for token in re.split(r"[,\s\n]+", text.upper()):
-        token = token.strip()
-        if CODIGO_REGEX.match(token):
-            return True
-    return False
-
-
-def parse_items_from_text(text: str) -> List[Dict[str, Any]]:
-    """
-    Parsea un texto tipo:
-      "CB004 x2, PN004 x1"
-    o en líneas:
-      "CB004 x2\nPN004 x1"
-
-    Devuelve: [{"codigo": "CB004", "cantidad": 2}, ...]
-    Si no encuentra cantidad, asume 1.
-    """
-    items: List[Dict[str, Any]] = []
-
-    # Separar por comas y por saltos de línea
-    partes_brutas: List[str] = []
-    for linea in text.splitlines():
-        partes_brutas.extend(p.strip() for p in linea.split(",") if p.strip())
-
-    for parte in partes_brutas:
-        tokens = parte.split()
-        if not tokens:
-            continue
-
-        codigo = tokens[0].strip().upper()
-        cantidad = 1
-
-        # Buscar primer número en el resto de tokens
-        for tok in tokens[1:]:
-            tok_clean = tok.lower().replace("x", "")
-            if tok_clean.isdigit():
-                cantidad = int(tok_clean)
-                break
-
-        items.append({"codigo": codigo, "cantidad": cantidad})
-
-    return items
-
-
-async def buscar_cliente_por_telefono(wa_phone: str) -> Optional[Dict[str, Any]]:
-    """
-    Llama al backend Nortsur para buscar un cliente por teléfono
-    usando /clientes/by-phone/{telefono}.
-    Devuelve el JSON del cliente o None si no existe.
-    """
-    if not NORTSUR_API_BASE_URL:
-        raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
-
-    telefono_normalizado = normalize_wa_phone(wa_phone)
-    url = f"{NORTSUR_API_BASE_URL}/clientes/by-phone/{telefono_normalizado}"
-
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        try:
-            resp = await client.get(url)
-        except httpx.RequestError as e:
-            print("Error al buscar cliente por teléfono:", repr(e))
-            return None
-
-        if resp.status_code == 200:
+        # El backend hoy devuelve JSON tipo:
+        # {"pedido_id": 7, "texto": "Pedido #7 – ..."}
+        # o a veces puede venir {"resumen": "..."} (compat)
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
             try:
-                return resp.json()
-            except Exception as e:
-                print("Error parseando JSON de cliente:", repr(e), resp.text[:200])
-                return None
+                data = r.json()
+                if isinstance(data, dict):
+                    texto = data.get("texto") or data.get("resumen")
+                    if isinstance(texto, str) and texto.strip():
+                        return texto.strip()
+            except Exception:
+                pass
 
-        if resp.status_code == 404:
-            # No está dado de alta
+        # fallback: texto plano
+        return r.text.strip()
+
+
+
+async def backend_post_estado(pedido_id: int, action: str, motivo: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    action: confirmar | entregar | cancelar | reabrir
+    Devuelve (ok, error_msg_si_falla)
+    """
+    url = f"{NORTSUR_API_BASE_URL}/pedidos/{pedido_id}/{action}"
+    payload = None
+    if action in ("cancelar", "reabrir"):
+        payload = {"motivo": (motivo or "").strip()}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code >= 400:
+            return False, f"{r.status_code} {r.text}"
+        return True, ""
+
+
+async def backend_find_cliente_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca cliente por q y retorna el match exacto por telefono si aparece.
+    """
+    url = f"{NORTSUR_API_BASE_URL}/clientes"
+    params = {"q": phone}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params)
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
             return None
 
-        # Otros errores "raros"
-        resp.raise_for_status()
+        # match exacto por telefono
+        for c in items:
+            if str(c.get("telefono", "")).strip() == str(phone).strip():
+                return c
         return None
 
 
-async def buscar_productos_por_descripcion(texto: str) -> List[Dict[str, Any]]:
-    """
-    Llama al backend Nortsur para buscar productos que matcheen la descripción.
-    Usa el endpoint /bot/productos/buscar del backend.
-    """
-    if not NORTSUR_API_BASE_URL:
-        raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
-
-    url = f"{NORTSUR_API_BASE_URL}/bot/productos/buscar"
-    params = {"texto": texto}
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+# ==========================
+# Comandos admin
+# ==========================
+ADMIN_RE = re.compile(r"^\s*(confirmar|entregar|cancelar|reabrir|resumen)\s+(\d+)(?:\s+(.*))?\s*$", re.IGNORECASE)
 
 
-def mensaje_formato_inicial() -> str:
-    """
-    Mensaje cuando no entendemos el formato del pedido.
-    """
-    return (
-        "No pude entender el pedido 😕\n\n"
-        "Usá este formato, por ejemplo:\n"
-        " • CB001 x1\n"
-        " • CB001 x2, CB004 x1\n"
-        " • combo pancho doble x1\n\n"
-        "Si querés ver el catálogo completo:\n"
-        f" 🌐 Web: {WEB_URL}\n"
-        f" 📸 Instagram: {INSTAGRAM}"
-    )
+def parse_admin_command(text_body: str) -> Optional[Tuple[str, int, Optional[str]]]:
+    m = ADMIN_RE.match(text_body or "")
+    if not m:
+        return None
+    cmd = m.group(1).lower()
+    pedido_id = int(m.group(2))
+    rest = m.group(3).strip() if m.group(3) else None
+    return cmd, pedido_id, rest
 
 
-def mensaje_bienvenida(nombre: Optional[str] = None, es_cliente: bool = False) -> str:
-    """
-    Mensaje de bienvenida:
-    - Si es_cliente=True y tenemos nombre → saludo personalizado.
-    - Si no, mensaje genérico para no clientes / desconocidos.
-    """
-    if es_cliente:
-        nombre = (nombre or "").strip()
-        cabecera = f"Hola {nombre}, soy el asistente de pedidos de *Nortsur*.\n\n"
-        cuerpo = (
-            "Podés hacer tu pedido mandando el *código* o la *descripción* "
-            "del producto o combo que querés.\n"
-            "Ejemplos:\n"
-            " • CB001 x2\n"
-            " • combo pancho doble x1\n"
-        )
-        return cabecera + cuerpo
-
-    # No cliente / genérico
-    return (
-        "Hola, soy el asistente de pedidos de *Nortsur*.\n\n"
-        "Si ya sos cliente, podés hacer tu pedido mandando el *código* o la "
-        "*descripción* del producto/combos.\n"
-        "Ejemplos:\n"
-        " • CB001 x2\n"
-        " • combo pancho doble x1\n\n"
-        "Te dejo algunos productos destacados 👇\n\n"
-        "Si todavía no sos cliente, podés ver nuestros productos en:\n"
-        f" Web: {WEB_URL}\n"
-        f" Instagram: {INSTAGRAM}\n\n"
-        "Después envianos tu *nombre*, *dirección* y *zona* para darte de alta.\n"
-    )
-
-
-def mensaje_error_generico() -> str:
-    return (
-        "Tuvimos un error al registrar tu pedido 😕\n"
-        "Por favor, intentá de nuevo en unos minutos o avisá al vendedor."
-    )
+def is_greeting(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in ("hola", "buenas", "buen día", "buen dia", "hello", "hi")
 
 
 # ==========================
-# Lógica principal de pedido
+# Webhook routes
 # ==========================
-async def enviar_pedido_a_nortsur(wa_phone: str, text_body: str) -> str:
-    """
-    Decide qué hacer con el mensaje del cliente:
-    - Si es un saludo / ayuda -> mensaje de bienvenida (personalizado si es cliente).
-    - Si contiene códigos -> usamos parse_items_from_text.
-    - Si es descripción -> buscamos en backend y si hay match único, armamos pedido.
-    """
-    if not NORTSUR_API_BASE_URL:
-        raise RuntimeError("NORTSUR_API_BASE_URL no está configurada")
-
-    text_body = (text_body or "").strip()
-    if not text_body:
-        return mensaje_formato_inicial()
-
-    lower = text_body.lower()
-
-    # 1) Mensajes de saludo / ayuda => bienvenida (personalizada si es cliente)
-    if any(
-        palabra in lower
-        for palabra in [
-            "hola",
-            "buenas",
-            "buen dia",
-            "buen día",
-            "menu",
-            "menú",
-            "productos",
-            "catálogo",
-            "catalogo",
-            "ayuda",
-        ]
-    ):
-        nombre_cliente: Optional[str] = None
-
-        try:
-            cliente = await buscar_cliente_por_telefono(wa_phone)
-            if cliente:
-                nombre_cliente = (cliente.get("nombre") or "").strip()
-        except Exception as e:
-            print("Error al buscar cliente en saludo:", repr(e))
-
-        if nombre_cliente:
-            # ✅ Cliente encontrado → saludo con nombre (sin imágenes)
-            return mensaje_bienvenida(nombre=nombre_cliente, es_cliente=True)
-        else:
-            # 🚫 No es cliente → devolvemos un marcador especial para
-            # que el webhook sepa que debe mandar imágenes luego del texto.
-            return "__NO_CLIENTE__" + mensaje_bienvenida()
-
-    # 2) Pedido con códigos (CB001, PN004, etc.)
-    if contiene_codigos(text_body):
-        items = parse_items_from_text(text_body)
-        if not items:
-            return mensaje_formato_inicial()
-    else:
-        # 3) Pedido por descripción
-        try:
-            productos = await buscar_productos_por_descripcion(text_body)
-        except Exception as e:
-            print("Error al buscar productos por descripción:", repr(e))
-            return mensaje_error_generico()
-
-        if not productos:
-            return (
-                "No encontré ningún producto que coincida con tu mensaje 😕\n\n"
-                "Si querés ver opciones y combos destacados, podés escribir *Hola* "
-                "y te muestro un resumen con imágenes.\n\n"
-                "También podés ver todos los productos en:\n"
-                f"🌐 Web: {WEB_URL}\n"
-                f"📸 Instagram: {INSTAGRAM}\n\n"
-                "O mandame el código del producto (por ejemplo: CB001 x1)."
-            )
-
-        if len(productos) > 1:
-            lineas = []
-            for p in productos:
-                linea = f"- {p.get('codigo', '')} {p.get('nombre', '')}".strip()
-                if p.get("presentacion"):
-                    linea += f" ({p['presentacion']})"
-                lineas.append(linea)
-            lista = "\n".join(lineas)
-            return (
-                "Encontré varios productos que coinciden con tu descripción:\n\n"
-                f"{lista}\n\n"
-                "Por favor, respondé con el *código* del que querés (por ejemplo: CB001 x2)."
-            )
-
-        # Un único producto => armamos pedido con ese código
-        p = productos[0]
-        cantidad = 1
-        for num in re.findall(r"\d+", text_body):
-            try:
-                cantidad = int(num)
-                break
-            except ValueError:
-                pass
-
-        items = [{"codigo": p["codigo"], "cantidad": cantidad}]
-
-    # Si llegamos acá, tenemos items y llamamos al backend para crear el pedido
-    payload = {
-        "wa_phone": wa_phone,
-        "observaciones": f"Pedido vía WhatsApp desde {wa_phone}",
-        "items": items,
-    }
-
-    posibles_paths = [
-        "/bot/pedidos/from-whatsapp",
-        "/bot/pedidos/from-whatsapp/",
-        "/pedidos/from-whatsapp",
-        "/pedidos/from-whatsapp/",
-    ]
-
-    data: Optional[Dict[str, Any]] = None
-
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for path in posibles_paths:
-            url = f"{NORTSUR_API_BASE_URL}{path}"
-            try:
-                resp = await client.post(url, json=payload)
-            except httpx.RequestError as e:
-                print("Error de red al llamar a:", url, repr(e))
-                continue
-
-            print("Intento Nortsur:", url, resp.status_code, resp.text)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                break
-
-            # Si es 404 o 405, probamos el siguiente path
-            if resp.status_code in (404, 405):
-                continue
-
-            # Para otros códigos (400, 500, etc.) levantamos el error
-            resp.raise_for_status()
-
-    if not data:
-        return mensaje_error_generico()
-
-    if not data.get("ok"):
-        # Permitimos que el backend mande su propio mensaje (por ej. "no sos cliente")
-        return data.get("mensaje_respuesta") or mensaje_error_generico()
-
-    return data["mensaje_respuesta"]
-
-
-# ==========================
-# Rutas FastAPI
-# ==========================
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/webhook", response_class=PlainTextResponse)
+@app.get("/webhook")
 async def verify_webhook(
-    hub_mode: str = Query(default="", alias="hub.mode"),
-    hub_challenge: str = Query(default="", alias="hub.challenge"),
-    hub_verify_token: str = Query(default="", alias="hub.verify_token"),
+    hub_mode: str = "",
+    hub_challenge: str = "",
+    hub_verify_token: str = "",
 ):
-    """
-    Endpoint que llama Meta al configurar el webhook (verificación inicial).
-    """
+    # Meta envía hub.mode, hub.challenge, hub.verify_token
     if hub_mode == "subscribe" and hub_verify_token == WA_VERIFY_TOKEN:
-        return hub_challenge
-    raise HTTPException(status_code=403, detail="Token de verificación inválido")
+        return PlainTextResponse(hub_challenge)
+    raise HTTPException(status_code=403, detail="Webhook verification failed")
 
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
-    body = await request.json()
+    payload = await request.json()
 
-    entry_list = body.get("entry", [])
-    if not entry_list:
-        return {"status": "ignored"}
+    message_id, from_phone, text_body = parse_incoming(payload)
 
-    for entry in entry_list:
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-            messages = value.get("messages", [])
-            if not messages:
-                continue
+    # WhatsApp manda muchos eventos sin messages -> ignorar
+    if not from_phone:
+        return {"ok": True}
 
-            for message in messages:
-                wa_message_id = message.get("id")
-                if is_duplicate_message(wa_message_id):
-                    # Meta puede reenviar el mismo mensaje varias veces
-                    continue
+    # anti-duplicados
+    if is_duplicate(message_id):
+        return {"ok": True, "duplicate": True}
 
-                # Solo procesamos mensajes de texto
-                if message.get("type") != "text":
-                    continue
+    # Si no hay texto (audio/imagen), por ahora respondemos guía corta
+    if not text_body:
+        if from_phone not in GREETED:
+            GREETED.add(from_phone)
+        await wa_send_text(
+            from_phone,
+            "Recibí tu mensaje. Por ahora tomamos pedidos por texto.\n"
+            "Ejemplos:\n"
+            " • CB001 x2\n"
+            " • combo pancho doble x1\n\n"
+            "Si querés un resumen: resumen 7",
+        )
+        return {"ok": True}
 
-                wa_phone = message.get("from")  # ej: "54911..."
-                text_body = message.get("text", {}).get("body", "").strip()
+    # ==========================
+    # 1) Comandos admin
+    # ==========================
+    admin = parse_admin_command(text_body)
+    if admin:
+        cmd, pedido_id, rest = admin
 
-                if not wa_phone:
-                    continue
+        # Ejecuta acción si corresponde
+        action_error = ""
+        if cmd in ("confirmar", "entregar", "cancelar", "reabrir"):
+            if cmd in ("cancelar", "reabrir") and not rest:
+                await wa_send_text(from_phone, f"Uso: {cmd} {pedido_id} <motivo>")
+                # IGUAL: siempre devolvemos resumen (según regla)
+                resumen = await backend_get_resumen(pedido_id)
+                await wa_send_text(from_phone, resumen)
+                return {"ok": True}
 
-                # --- NUEVO: control para saber si hay que mandar imágenes luego ---
-                send_no_cliente_images = False
+            ok, err = await backend_post_estado(pedido_id, cmd, motivo=rest)
+            if not ok:
+                action_error = f"⚠️ No pude ejecutar '{cmd}' para el pedido {pedido_id}: {err}\n\n"
 
-                # Procesamos el pedido / mensaje
-                try:
-                    respuesta = await enviar_pedido_a_nortsur(
-                        wa_phone,
-                        text_body or "",
-                    )
-                except Exception as e:
-                    print("Error al procesar mensaje:", repr(e))
-                    respuesta = mensaje_error_generico()
+        # SIEMPRE devolvemos resumen
+        try:
+            resumen = await backend_get_resumen(pedido_id)
+            await wa_send_text(from_phone, (action_error + resumen).strip())
+        except Exception as e:
+            await wa_send_text(from_phone, f"⚠️ Error consultando resumen del pedido {pedido_id}: {e}")
+        return {"ok": True}
 
-                # Detectamos el caso especial de saludo NO cliente
-                if respuesta.startswith("__NO_CLIENTE__"):
-                    send_no_cliente_images = True
-                    respuesta = respuesta[len("__NO_CLIENTE__"):]
+    # ==========================
+    # 2) Saludo + identificación cliente / no cliente
+    # ==========================
+    cliente = await backend_find_cliente_by_phone(from_phone)
 
-                # 1) Enviamos SIEMPRE el texto primero
-                try:
-                    await send_whatsapp_text(wa_phone, respuesta)
-                except Exception as e:
-                    print("Error al enviar mensaje de WhatsApp:", repr(e))
+    if cliente is None:
+        # __NO_CLIENTE__
+        if from_phone not in GREETED or is_greeting(text_body):
+            GREETED.add(from_phone)
 
-                # 2) Si corresponde, mandamos las imágenes después del texto
-                if send_no_cliente_images and IMGS_NO_CLIENTE:
-                    for url in IMGS_NO_CLIENTE:
-                        try:
-                            await send_whatsapp_image(
-                                wa_phone,
-                                url,
-                                caption="Producto destacado Nortsur",
-                            )
-                        except Exception as e:
-                            print("Error al enviar imagen NO cliente:", repr(e))
+            texto = (
+                "Hola! Soy el asistente de pedidos de Nortsur.\n\n"
+                "Todavía no tengo tu número registrado como cliente.\n"
+                "Igual te comparto la lista de productos y quedo listo para tomar tu pedido.\n"
+                "Podés pedir por texto usando nombre o descripción.\n\n"
+                "Ejemplos:\n"
+                " • combo pancho doble x1\n"
+                " • pan doble canaleta x3\n"
+                " • mayonesa 500ml x2\n"
+            )
+            await wa_send_text(from_phone, texto)
 
-    return {"status": "ok"}
+            # Enviar imágenes DESPUÉS del texto
+            for img in list_no_cliente_images():
+                await wa_send_image_url(from_phone, img)
+
+        else:
+            # si no fue saludo, igual damos guía mínima
+            await wa_send_text(
+                from_phone,
+                "Para empezar: mandame qué querés pedir por nombre/descrición.\n"
+                "Ej: combo pancho doble x1",
+            )
+        return {"ok": True, "no_cliente": True}
+
+    # Cliente OK
+    nombre = str(cliente.get("nombre", ""))
+    if from_phone not in GREETED or is_greeting(text_body):
+        GREETED.add(from_phone)
+        await wa_send_text(
+            from_phone,
+            f"Hola {nombre}, soy el asistente de pedidos de Nortsur.\n\n"
+            "Podés hacer tu pedido mandando el código o la descripción del producto o combo que querés.\n"
+            "Ejemplos:\n"
+            " • CB001 x2\n"
+            " • combo pancho doble x1\n\n"
+            "Si querés un resumen de un pedido: resumen 7",
+        )
+        return {"ok": True}
+
+    # ==========================
+    # 3) Flujo pedido (por ahora: guía)
+    # ==========================
+    await wa_send_text(
+        from_phone,
+        "Perfecto. Mandame tu pedido por texto con producto + cantidad.\n"
+        "Ej:\n"
+        " • combo pancho doble x1\n"
+        " • mayonesa 500ml x2\n\n"
+        "Si necesitás: resumen 7",
+    )
+    return {"ok": True}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
